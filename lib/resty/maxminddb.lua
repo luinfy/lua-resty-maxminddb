@@ -21,8 +21,9 @@ local ffi_cast            = ffi.cast
 local ffi_gc              = ffi.gc
 local C                   = ffi.C
 
+local _D    ={}
 local _M    ={}
-_M._VERSION = '1.3.2'
+_M._VERSION = '1.3.3'
 local mt = { __index = _M }
 
 -- copy from https://github.com/lilien1010/lua-resty-maxminddb/blob/f96633e2428f8f7bcc1e2a7a28b747b33233a8db/resty/maxminddb.lua#L36-L126
@@ -167,27 +168,34 @@ local maxm                                          = ffi.load('libmaxminddb')
 local mmdb                                          = ffi_new('MMDB_s')
 local initted                                       = false
 
-local function mmdb_strerror(rc)
-    return ffi_str(maxm.MMDB_strerror(rc))
+local function mmdb_strerror(profile, rc)
+    return ffi_str(_D[profile].maxm.MMDB_strerror(rc))
 end
 
 local function gai_strerror(rc)
     return ffi_str(C.gai_strerror(rc))
 end
 
-function _M.init(dbfile)
-  if not initted then
-    local maxmind_ready   = maxm.MMDB_open(dbfile,0,mmdb)
+function _M.init(profiles)
 
+  for profile, location in pairs(profiles) do
+    
+    _D[profile] = {}
+    _D[profile].maxm = ffi.load('libmaxminddb') 
+    _D[profile].mmdb = ffi_new('MMDB_s')
+    local maxmind_ready = _D[profile].maxm.MMDB_open(location, 0, _D[profile].mmdb)
+    
     if maxmind_ready ~= MMDB_SUCCESS then
-        return nil, mmdb_strerror(maxmind_ready)
+      return nil, mmdb_strerror(profile, maxmind_ready)
     end
-    
-    initted = true
-    
-    ffi_gc(mmdb, maxm.MMDB_close)
+
+    ffi_gc(_D[profile].mmdb, _D[profile].maxm.MMDB_close)
+
   end
+
+  initted = true
   return initted
+
 end
 
 function _M.initted()
@@ -312,7 +320,7 @@ local function _dump_entry_data_list(entry_data_list,status)
   return entry_data_list,status,result
 end
 
-function _M.lookup(ip)
+function _M.lookup(profile, ip)
 
   if not initted then
       return nil, "not initialized"
@@ -322,10 +330,10 @@ function _M.lookup(ip)
   local gai_error = ffi_new('int[1]')
   local mmdb_error = ffi_new('int[1]')
 
-  local result = maxm.MMDB_lookup_string(mmdb,ip,gai_error,mmdb_error)
+  local result = _D[profile].maxm.MMDB_lookup_string(_D[profile].mmdb,ip,gai_error,mmdb_error)
 
   if mmdb_error[0] ~= MMDB_SUCCESS then
-    return nil,'lookup failed: ' .. mmdb_strerror(mmdb_error[0])
+    return nil,'lookup failed: ' .. mmdb_strerror(profile, mmdb_error[0])
   end
 
   if gai_error[0] ~= MMDB_SUCCESS then
@@ -338,18 +346,18 @@ function _M.lookup(ip)
 
   local entry_data_list = ffi_cast('MMDB_entry_data_list_s **const',ffi_new("MMDB_entry_data_list_s"))
 
-  local status = maxm.MMDB_get_entry_data_list(result.entry,entry_data_list)
+  local status = _D[profile].maxm.MMDB_get_entry_data_list(result.entry,entry_data_list)
 
   if status ~= MMDB_SUCCESS then
-    return nil,'get entry data failed: ' .. mmdb_strerror(status)
+    return nil,'get entry data failed: ' .. mmdb_strerror(profile, status)
   end  
   
   local head = entry_data_list[0] -- Save so this can be passed to free fn.
   local _,status,result = _dump_entry_data_list(entry_data_list)
-  maxm.MMDB_free_entry_data_list(head)
+  _D[profile].maxm.MMDB_free_entry_data_list(head)
   
   if status ~= MMDB_SUCCESS then
-    return nil,'dump entry data failed: ' .. mmdb_strerror(status)
+    return nil,'dump entry data failed: ' .. mmdb_strerror(profile, status)
   end
   
   
