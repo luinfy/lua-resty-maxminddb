@@ -1,0 +1,131 @@
+Hi, today I went down this rabbit hole and I'd like to add my findings:
+
+I don't think "this lib only supports city db" is completely accurate, I have tried country and asn, and both work perfectly. In fact, I've been using this lib with ASN db in prod for a long time now with 0 issues.
+The problem where you cannot load both at the same time does exist, but I've managed to work around it with minimal hacks to the code.
+In my usacase, I load the maxmind databases in init_by_lua* so on each request I can just do the lookup, I think this should be faster but I haven't verified with load tests.
+The hack (ugly, but works):
+
+--- maxminddb.lua	2021-02-23 18:27:21.000000000 -0800
++++ maxminddb.lua_new	2021-02-23 17:20:20.000000000 -0800
+@@ -1,3 +1,5 @@
++-- {{ ansible_managed }}
++
+ --[[
+ 	Copyright 2017-now anjia (anjia0532@gmail.com)
+
+@@ -165,6 +167,7 @@
+ local maxm                                          = ffi.load('libmaxminddb')
+ --https://github.com/maxmind/libmaxminddb
+ local mmdb                                          = ffi_new('MMDB_s')
++local mmdb_asn                                      = ffi_new('MMDB_s')
+ local initted                                       = false
+
+ local function mmdb_strerror(rc)
+@@ -175,17 +178,23 @@
+     return ffi_str(C.gai_strerror(rc))
+ end
+
+-function _M.init(dbfile)
++function _M.init(dbfile,dbfile_asn)
+   if not initted then
+     local maxmind_ready   = maxm.MMDB_open(dbfile,0,mmdb)
++    local maxmind_ready_asn   = maxm.MMDB_open(dbfile_asn,0,mmdb_asn)
+
+     if maxmind_ready ~= MMDB_SUCCESS then
+         return nil, mmdb_strerror(maxmind_ready)
+     end
+
++    if maxmind_ready_asn ~= MMDB_SUCCESS then
++        return nil, mmdb_strerror(maxmind_ready_asn)
++    end
++
+     initted = true
+
+     ffi_gc(mmdb, maxm.MMDB_close)
++    ffi_gc(mmdb_asn, maxm.MMDB_close)
+   end
+   return initted
+ end
+@@ -356,6 +365,51 @@
+   return result
+ end
+
++
++function _M.lookup_asn(ip)
++
++  if not initted then
++      return nil, "not initialized"
++  end
++
++  -- copy from https://github.com/lilien1010/lua-resty-maxminddb/blob/f96633e2428f8f7bcc1e2a7a28b747b33233a8db/resty/maxminddb.lua#L159-L176
++  local gai_error = ffi_new('int[1]')
++  local mmdb_error = ffi_new('int[1]')
++
++  local result = maxm.MMDB_lookup_string(mmdb_asn,ip,gai_error,mmdb_error)
++
++  if mmdb_error[0] ~= MMDB_SUCCESS then
++    return nil,'lookup failed: ' .. mmdb_strerror(mmdb_error[0])
++  end
++
++  if gai_error[0] ~= MMDB_SUCCESS then
++    return nil,'lookup failed: ' .. gai_strerror(gai_error[0])
++  end
++
++  if true ~= result.found_entry then
++    return nil,'not found'
++  end
++
++  local entry_data_list = ffi_cast('MMDB_entry_data_list_s **const',ffi_new("MMDB_entry_data_list_s"))
++
++  local status = maxm.MMDB_get_entry_data_list(result.entry,entry_data_list)
++
++  if status ~= MMDB_SUCCESS then
++    return nil,'get entry data failed: ' .. mmdb_strerror(status)
++  end
++
++  local head = entry_data_list[0] -- Save so this can be passed to free fn.
++  local _,status,result = _dump_entry_data_list(entry_data_list)
++  maxm.MMDB_free_entry_data_list(head)
++
++  if status ~= MMDB_SUCCESS then
++    return nil,'dump entry data failed: ' .. mmdb_strerror(status)
++  end
++
++
++  return result
++end
++
+ -- copy from https://github.com/lilien1010/lua-resty-maxminddb/blob/master/resty/maxminddb.lua#L208
+ -- https://www.maxmind.com/en/geoip2-databases  you should download  the mmdb file from maxmind
+Basically I'm duplicating what I need to be able to have 2 databases open at the same time in without the second one using the same resource as the first, and without running into the problem described attempt to redefine 'MMDB_entry_s' at line 4 when you copy/duplicate the maxminddb.lua lib.
+
+I load it in init_by_lua* in nginx.conf passing both databases as args:
+
+  init_by_lua_block {
+    -- Load MaxMind ASN DB here so we don't have to load it per request in content_by_lua_*
+    MMDB = require("maxminddb")
+    MMDB.init("/var/lib/GeoIP/GeoLite2-Country.mmdb","/var/lib/GeoIP/GeoLite2-ASN.mmdb")
+  }
+And then later in the http server blocks, I can do:
+
+      set_by_lua_block $request_country {
+        local res, err = MMDB.lookup(ngx.var.remote_addr)
+        if res then
+            ngx.req.set_header("X-Client-Geo-Region", res.country.iso_code)
+            return res.country.iso_code
+        end
+        return ""
+      }
+Or if I need info from the ASN:
+
+      set_by_lua_block $request_asn {
+        local res, err = MMDB.lookup_asn(ngx.var.remote_addr)
+        if res then
+            ngx.req.set_header("X-Client-ASN", res.autonomous_system_number)
+            return res.autonomous_system_number
+        end
+        return ""
+      }
+This patch solves my use case, I need country and asn, but it should be pretty straight forward to adapt for other use cases.
+
+I hope this helps anyone else that gets stuck with this.
